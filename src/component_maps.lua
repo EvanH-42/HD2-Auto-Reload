@@ -22,9 +22,14 @@ component_static_record = function(e, row, name)
     if not index or index >= #spec.map / 16 then return nil end
     local address = e.pointer(e.owner + spec.slot, true)
     -- Compare the whole resource/index map, including bytes beyond the prefix.
+    if e.metrics then e.metrics.map_checks = e.metrics.map_checks + 1 end
     for offset = 0, #spec.map - 1, 2048 do
         local wanted = spec.map:sub(offset + 1, offset + 2048)
-        if e.read(address + offset, #wanted) ~= wanted then return nil end
+        if e.metrics then
+            e.metrics.map_reads = e.metrics.map_reads + 1
+            e.metrics.map_bytes = e.metrics.map_bytes + #wanted
+        end
+        if e.read(address + offset, #wanted, false, 'static_map') ~= wanted then return nil end
     end
     assert(e.read(address + entry_offset, 16, true) ==
         spec.map:sub(entry_offset + 1, entry_offset + 16), 'static_resource_identity_changed')

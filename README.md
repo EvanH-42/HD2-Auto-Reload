@@ -52,6 +52,18 @@ python scripts/build.py --game-dir '你的 Steam 游戏目录/Helldivers 2'
 当前本地默认产物为 `build/Auto-Reload-v0.7.0.zip`；加 `--enable-tactical-reload` 会生成 `build/Auto-Reload-v0.7.0-tactical.zip`。所有包沿用同一 GUID，只能部署其中一份。`build/` 不纳入源码提交。
 使用武器配置、但不试验内部函数请选择 **`build/Auto-Reload-v0.7.0-tactical.zip`**。普通 `Auto-Reload-v0.7.0.zip` 只执行空仓换弹。
 
+### 性能统计（P0）
+
+`python scripts/build.py --enable-tactical-reload --perf` 生成
+`build/Auto-Reload-v0.7.0-tactical-perf.zip`。`--perf` 默认关闭，可与 `--debug` 组合；
+P0 构建不改变换弹规则或采样频率。`START` 行记录 `perf=true`，每 10 秒输出一组累计 `PERF` 行。
+
+性能对照包：加 `--optimization-stage p1` 启用安全上下文缓存；加 `--optimization-stage p2`
+启用缓存及前台 120 Hz 日常采样。这两个阶段要求 `--enable-tactical-reload`，自动启用统计，
+分别生成 `Auto-Reload-v0.7.0-tactical-p1-perf.zip` 和 `Auto-Reload-v0.7.0-tactical-p2-perf.zip`。
+一次只安装一份，替换后重启游戏。离线结果与实机对照见 [P1/P2 说明](docs/PERFORMANCE_P1_P2.md)。
+详见 [统计口径与离线测量](docs/PERFORMANCE_P0.md)。此统计版沿用相同 GUID，应替换现有包，仅启用一份。
+
 ### 原生换弹实验包
 
 `python scripts/build.py --native-reload --enable-tactical-reload --game-dir '你的 Steam 游戏目录/Helldivers 2'` 生成 `build/Auto-Reload-v0.7.0-native-tactical.zip`。只支持 Steam build `25480438`：已验证当前武器的 Reload 组件、配置及动作空闲时调用游戏换弹函数；缺少可验证组件的武器回退到模拟 R。它恢复全部现有空仓与战术规则，不再只限 GL-15。GL-15 沿用**弹匣加膛内总弹 ≤2**的阈值；余量为 2 时仍遵循原有 0.1 秒及连续点击等待，余量为 1 时立即请求。逐发续装只在观察到弹药增加且动作空闲后再次请求。不要与普通包或旧 GL-15 原生实验包同时启用；关闭游戏后替换、部署并重启。仅旧实验包的 GL-15 空仓路径得到实机反馈，其余武器和提前换弹仍需验证。见 [原生换弹说明](docs/NATIVE_RELOAD.md)。

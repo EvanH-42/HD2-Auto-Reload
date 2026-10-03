@@ -13,6 +13,9 @@ VERSION = '0.7.0'
 MARKER = '-- STATIC_COMPONENT_READER_INSERT'
 DEBUG_MARKER = 'local DEBUG = false -- DEBUG_BUILD_FLAG'
 NATIVE_MARKER = 'local NATIVE_RELOAD = false -- NATIVE_RELOAD_FLAG'
+PERF_MARKER = 'local PERF = false -- PERF_BUILD_FLAG'
+STAGE_MARKER = 'local OPTIMIZATION_STAGE = 0 -- OPTIMIZATION_STAGE_FLAG'
+FAST_MARKER = '-- FAST_CONTEXT_READER_INSERT'
 CONFIG_MARKER = '-- RELOAD_CONFIG_INSERT'
 MAPS = {
     'MAGAZINE': ROOT / 'data/WeaponMagazineComponent.25327279.map.hex',
@@ -20,6 +23,7 @@ MAPS = {
     'HEAT': ROOT / 'data/WeaponHeatComponent.25327279.map.hex',
 }
 INSERT = (ROOT / 'src/component_maps.lua').read_text(encoding='utf-8')
+FAST_INSERT = (ROOT / 'src/fast_context.lua').read_text(encoding='utf-8')
 RELOAD_CONFIG = ROOT / 'src/reload_config.lua'
 RULE_LINE = re.compile(
     r"\s*\['([0-9a-f]{16})'\] = \{name='[^']+', path='(weapon_magazine|weapon_rounds)', "
@@ -77,11 +81,17 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--game-dir', type=Path, help='Optional local game directory for SHA256 verification')
     parser.add_argument('--debug', action='store_true', help='Build a diagnostic package with reload trace logging')
+    parser.add_argument('--perf', action='store_true', help='Enable cumulative performance counters every 10 seconds')
+    parser.add_argument('--optimization-stage', choices=('p0', 'p1', 'p2'), default='p0',
+                        help='p1: cached reader; p2: cached reader plus 120 Hz polling; p1/p2 enable perf')
     parser.add_argument('--enable-tactical-reload', action='store_true',
                         help='启用战术换弹 in the built package; no in-game setting')
     parser.add_argument('--native-reload', action='store_true',
                         help='Build the experimental native reload package for build 25480438')
     args = parser.parse_args()
+    if args.optimization_stage != 'p0' and (args.native_reload or not args.enable_tactical_reload):
+        parser.error('p1/p2 require --enable-tactical-reload and do not support --native-reload')
+    args.perf = args.perf or args.optimization_stage != 'p0'
     if args.native_reload and not args.game_dir:
         parser.error('Native reload requires --game-dir for SHA256 verification')
     supported_hashes = {
@@ -104,19 +114,24 @@ def main():
             r'\g<1>true\g<2>', reload_config, count=1, flags=re.M)
     if (source.count(MARKER) != 1 or source.count(DEBUG_MARKER) != 1 or
             source.count(NATIVE_MARKER) != 1 or
+            source.count(PERF_MARKER) != 1 or
+            source.count(STAGE_MARKER) != 1 or source.count(FAST_MARKER) != 1 or
             source.count(CONFIG_MARKER) != 1):
         raise SystemExit('source build marker missing or duplicated')
     insertion = INSERT
     for name, path in MAPS.items():
         insertion = insertion.replace('__' + name + '_MAP__', bytes.fromhex(path.read_text()).hex())
-    generated = source.replace(MARKER, insertion).replace(
+    generated = source.replace(MARKER, insertion).replace(FAST_MARKER, FAST_INSERT).replace(
         CONFIG_MARKER, reload_config).replace(
         DEBUG_MARKER, 'local DEBUG = ' + str(args.debug).lower() + ' -- DEBUG_BUILD_FLAG').replace(
         NATIVE_MARKER, 'local NATIVE_RELOAD = ' + str(args.native_reload).lower() +
-        ' -- NATIVE_RELOAD_FLAG')
+        ' -- NATIVE_RELOAD_FLAG').replace(
+        PERF_MARKER, 'local PERF = ' + str(args.perf).lower() + ' -- PERF_BUILD_FLAG').replace(
+        STAGE_MARKER, 'local OPTIMIZATION_STAGE = ' + args.optimization_stage[-1] + ' -- OPTIMIZATION_STAGE_FLAG')
     BUILD.mkdir(parents=True, exist_ok=True)
     suffix = ('-native' if args.native_reload else '') + (
-        '-tactical' if args.enable_tactical_reload else '') + ('-debug' if args.debug else '')
+        '-tactical' if args.enable_tactical_reload else '') + ('-debug' if args.debug else '') + (
+        '-' + args.optimization_stage if args.optimization_stage != 'p0' else '') + ('-perf' if args.perf else '')
     entry = BUILD / ('auto_reload_entry' + suffix.replace('-', '_') + '.lua')
     entry.write_text(generated, encoding='utf-8', newline='\n')
     version = 'v' + VERSION
@@ -126,6 +141,8 @@ def main():
                 'Auto Reload ' + version + (' tactical' if args.enable_tactical_reload else '') +
                 (' native reload' if args.native_reload else '') +
                 (' Debug' if args.debug else '') +
+                (' Perf' if args.perf else '') +
+                (' ' + args.optimization_stage.upper() if args.optimization_stage != 'p0' else '') +
                 (' (native preferred; build 25480438; experimental)' if args.native_reload
                  else ' (immediate; Heat; builds 25327279/25480438)'))
     print('Built', output)

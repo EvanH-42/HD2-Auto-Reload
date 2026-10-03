@@ -35,7 +35,9 @@ local function scenario(tactical_enabled, native_enabled)
     setfenv(factory, setmetatable({RELOAD_DELAY_SECONDS=1, state=state, api=api,
         bit=require('bit'), unsafe_resources={unsafe=true},
         NATIVE_RELOAD=native_enabled,
+        OPTIMIZATION_STAGE=0,
         context_reader=function() return fresh end,
+        observed_context=function() return true, fresh end,
         emit=function(s) logs[#logs+1]=s end, debug_emit=function() end,
         scalar=tostring}, {__index=_G}))
     local step, empty, continuous, probe = factory()
@@ -492,7 +494,7 @@ test('native magazine reader validates entity and exact layout', function()
     local pointers={[0x20000+0x38]=0x30000,[0x30000+2*8]=0x40000,
         [0x20000+0x48]=0x50000,[0x20000+0x50]=0x60000}
     local verified=true
-    local chunk=assert(source:match('(local function read_magazine_component.-)\nlocal function context_reader'))
+    local chunk=assert(source:match('(local function decode_magazine.-)\nlocal function context_reader'))
     local factory=assert(loadstring(chunk..'\nreturn read_magazine_component'))
     setfenv(factory,setmetatable({u32=u32,hex=hex,magazine_static_records=function()
         if verified then return {magazine=string.rep('\0',160)} end
@@ -575,7 +577,7 @@ test('native heat reader checks identity, flags and effective override', functio
     }
     local pointers={[0x20040]=0x30000,[0x30010]=0x40000,[0x20058]=0x60000,[0x200a8]=0x70000}
     local verified,override=true,nil
-    local chunk=assert(source:match('(local function read_heat_component.-)\nlocal function context_reader'))
+    local chunk=assert(source:match('(local function decode_magazine.-)\nlocal function context_reader'))
     local factory=assert(loadstring(chunk..'\nreturn read_heat_component'))
     setfenv(factory,setmetatable({u32=u32,hex=hex,component_static_record=function(_,_,name)
         assert(name=='heat'); if verified then return config(true) end

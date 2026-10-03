@@ -8,6 +8,8 @@ if existing then return existing end
 
 local DEBUG = false -- DEBUG_BUILD_FLAG
 local NATIVE_RELOAD = false -- NATIVE_RELOAD_FLAG
+local PERF = false -- PERF_BUILD_FLAG
+local OPTIMIZATION_STAGE = 0 -- OPTIMIZATION_STAGE_FLAG
 local CONTINUOUS_RELOAD_INTERVAL_SECONDS = 0.1
 local TACTICAL_RAPID_CLICK_WINDOW_SECONDS = 0.5
 local TACTICAL_CLICK_DELAYS = {0.1, 0.2, 0.4, 0.6}
@@ -44,6 +46,56 @@ local function debug_emit(line)
         pcall(function() file:write(line .. '\n'); file:flush() end)
     else
         print('[AutoReload] ' .. line)
+    end
+end
+
+-- Performance counters are cumulative and never authorize gameplay actions.
+local perf_fields = {'read_attempts', 'read_successes', 'read_failures', 'requested_bytes',
+    'guard_rereads', 'map_checks', 'map_reads', 'map_bytes', 'reader_attempts',
+    'reader_successes', 'reader_failures', 'observed_contexts', 'reader_seconds',
+    'full_readers', 'fast_readers', 'cache_hits', 'cache_invalidations', 'cache_builds'}
+local perf_categories = {'initialization', 'periodic', 'reload_refresh', 'continuous_refresh', 'other'}
+local function perf_bucket(name)
+    local bucket = state.perf.categories[name]
+    if not bucket then
+        bucket = {}
+        for _, field in ipairs(perf_fields) do bucket[field] = 0 end
+        state.perf.categories[name] = bucket
+    end
+    return bucket
+end
+if PERF then
+    state.perf = {categories={}, next_report=10, updates=0, active='initialization'}
+    for _, name in ipairs(perf_categories) do perf_bucket(name) end
+end
+local function perf_attach(api)
+    if not PERF then return end
+    local original = api.read
+    api.read = function(address, size)
+        local bucket = perf_bucket(state.perf.active)
+        bucket.read_attempts = bucket.read_attempts + 1
+        bucket.requested_bytes = bucket.requested_bytes + size
+        local ok, result = pcall(original, address, size)
+        if ok and type(result) == 'string' and #result == size then
+            bucket.read_successes = bucket.read_successes + 1
+        else
+            bucket.read_failures = bucket.read_failures + 1
+        end
+        if not ok then error(result, 0) end
+        return result
+    end
+end
+local function perf_report()
+    if not PERF or state.elapsed < state.perf.next_report then return end
+    state.perf.next_report = state.elapsed + 10
+    for _, name in ipairs(perf_categories) do
+        local bucket = perf_bucket(name)
+        local fields = {string.format('PERF scope=cumulative elapsed=%.3f updates=%d category=%s',
+            state.elapsed, state.perf.updates, name)}
+        for _, field in ipairs(perf_fields) do
+            fields[#fields + 1] = field .. '=' .. tostring(bucket[field])
+        end
+        emit(table.concat(fields, ' '))
     end
 end
 
@@ -96,6 +148,18 @@ local function read_api()
     local process_id = kernel.GetCurrentProcessId()
     local api = {}
     function api.now() return tonumber(kernel.GetTickCount64()) / 1000 end
+    if PERF or (OPTIMIZATION_STAGE or 0) >= 2 then
+        ffi.cdef('int QueryPerformanceCounter(int64_t *); int QueryPerformanceFrequency(int64_t *);')
+        local frequency, counter = ffi.new('int64_t[1]'), ffi.new('int64_t[1]')
+        assert(kernel.QueryPerformanceFrequency(frequency) ~= 0, 'perf_clock_unavailable')
+        local divisor = tonumber(frequency[0])
+        local function precise_now()
+            assert(kernel.QueryPerformanceCounter(counter) ~= 0, 'perf_clock_unavailable')
+            return tonumber(counter[0]) / divisor
+        end
+        if PERF then api.perf_now = precise_now end
+        if (OPTIMIZATION_STAGE or 0) >= 2 then api.poll_now = precise_now end
+    end
     function api.module(name)
         local handle = kernel.GetModuleHandleA(name)
         if handle == nil then return nil end
@@ -236,6 +300,36 @@ end
 
 local magazine_static_records, component_static_record
 
+local function decode_magazine(row, ammo, runtime)
+    local count, token = u32(ammo, 0), u32(ammo, 8)
+    assert(count < 100000, 'magazine_count_invalid')
+    row.magazine_count, row.magazine_chamber_token = count, token
+    row.magazine_chamber_blocked = runtime:byte(9) ~= 0
+    row.ammo_status = count == 0 and token == 0 and 'magazine_and_chamber_empty' or 'ammo_present'
+end
+local function decode_rounds(row, rounds, runtime)
+    local selected = u32(runtime, 4)
+    assert(selected <= 1, 'rounds_selected_magazine_invalid')
+    row.rounds_selected_magazine = selected
+    row.rounds_magazine_count = u32(rounds, 4 + selected * 4)
+    row.rounds_chamber_token = u32(rounds, 0x10)
+    row.rounds_chamber_blocked = runtime:byte(0x11) ~= 0
+    row.ammo_status = row.rounds_magazine_count > 0 and 'magazine_nonempty' or 'magazine_empty'
+    if row.rounds_chambered then
+        row.ammo_status = row.rounds_chamber_blocked and 'chamber_blocked' or
+            row.rounds_chamber_token == 0 and 'chamber_empty' or 'chamber_ready'
+    end
+end
+local function decode_heat(row, runtime)
+    local locked = runtime:byte(9)
+    assert(locked == 0 or locked == 1, 'heat_overheat_flag_invalid')
+    row.heat_overheated = locked == 1
+    row.heat_spares = u32(runtime, 0)
+    row.heat_value_bits = hex(runtime:sub(5, 8))
+    row.ammo_status = row.heat_overheated and
+        (row.heat_requires_replacement and 'heat_sink_burned_out' or 'heat_cooling_lock') or 'heat_ready'
+end
+
 local function read_magazine_component(e, row)
     -- Build 25327279 ammo query 0x744d02..0x744db7. No game calls.
     assert(e.read(e.game + 0x744d02, 7) == '\x48\x8b\x2d\x3f\x19\xbe\x02',
@@ -252,19 +346,14 @@ local function read_magazine_component(e, row)
     local registry = e.pointer(manager + 0x38, true)
     assert(e.read(e.pointer(registry + index * 8, true), 24, true) == e.weapon,
         'magazine_component_identity_mismatch')
-    local ammo = e.read(e.pointer(manager + 0x48, true) + index * 16, 16, true)
-    local runtime = e.read(e.pointer(manager + 0x50, true) + index * 12, 12, true)
-    local count, token = u32(ammo, 0), u32(ammo, 8)
-    assert(count < 100000, 'magazine_count_invalid')
-    row.magazine_count = count
-    row.magazine_chamber_token = token
-    row.magazine_chamber_blocked = runtime:byte(9) ~= 0
+    local ammo = e.read(e.pointer(manager + 0x48, true) + index * 16, 16, true, 'ammo')
+    local runtime = e.read(e.pointer(manager + 0x50, true) + index * 12, 12, true, 'runtime')
     row.magazine_template_chambered = records.magazine:byte(157) ~= 0
     row.magazine_verified = true
     -- Require BOTH counters empty. This is conservative even if an entity
     -- configuration override changes the static template's chambered flag.
     -- A blocked chamber containing a round is not sufficient to request R.
-    row.ammo_status = count == 0 and token == 0 and 'magazine_and_chamber_empty' or 'ammo_present'
+    decode_magazine(row, ammo, runtime)
     row.ammo_counter_semantics = 'native_magazine_count_and_chamber_token'
 end
 
@@ -288,29 +377,27 @@ local function read_heat_component(e, row)
         assert(override < 4096, 'heat_override_index_invalid')
         config = e.read(e.pointer(manager + 0xa8, true) + override * 0x250, 0x250, true)
     end
-    local runtime = e.read(e.pointer(manager + 0x58, true) + index * 12, 12, true)
-    local locked = runtime:byte(9)
-    assert(locked == 0 or locked == 1, 'heat_overheat_flag_invalid')
+    local runtime = e.read(e.pointer(manager + 0x58, true) + index * 12, 12, true, 'runtime')
     assert(config:byte(0x51) <= 1 and config:byte(0x91) <= 1, 'heat_config_flags_invalid')
     row.heat_verified = true
-    row.heat_overheated = locked == 1
     -- +0x90 prevents automatic cooling/lock clearing in 0x762f60.
     -- Cooling weapons must not discard a usable heat sink just for being hot.
     row.heat_requires_replacement = config:byte(0x51) == 1 and config:byte(0x91) == 1
-    row.heat_spares = u32(runtime, 0)
-    row.heat_value_bits = hex(runtime:sub(5, 8))
     row.heat_config_source = override and 'entity_override' or 'resource_template'
-    row.ammo_status = row.heat_overheated and
-        (row.heat_requires_replacement and 'heat_sink_burned_out' or 'heat_cooling_lock') or 'heat_ready'
+    decode_heat(row, runtime)
 end
 
-local function context_reader(api, game, extend)
+local function context_reader(api, game, extend, metrics, capture)
     local guards, reads, bytes = {}, 0, 0
-    local function read(address, size, guard)
+    local dependencies = capture and {} or nil
+    local function read(address, size, guard, kind)
         reads, bytes = reads + 1, bytes + size
         assert(reads <= 768 and bytes <= 32768, 'snapshot_budget')
         local result = assert(api.read(address, size), 'read_unavailable')
         assert(#result == size, 'short_read')
+        if dependencies then
+            dependencies[#dependencies + 1] = {address=address, expected=result, guard=guard, kind=kind}
+        end
         if guard then guards[#guards + 1] = {address, result} end
         return result
     end
@@ -335,15 +422,18 @@ local function context_reader(api, game, extend)
     end
     local function checked()
         for _, guard in ipairs(guards) do
+            if metrics then metrics.guard_rereads = metrics.guard_rereads + 1 end
             if read(guard[1], #guard[2]) ~= guard[2] then return false end
         end
         return true
     end
     local function finish(row, reason)
+        local resolved = dependencies
+        dependencies = nil -- Do not record the second consistency pass.
         if not checked() then return nil, 'context_changed_during_read' end
         row.context_status = reason
         row.memory_reads, row.memory_bytes = reads, bytes
-        return row
+        return row, nil, resolved
     end
 
     local row = {
@@ -381,7 +471,7 @@ local function context_reader(api, game, extend)
     if read(pointer(pointer(inventory + 0x40, true) + inventory_index * 8, true), 24, true) ~= entity then
         return finish(row, 'inventory_owner_mismatch')
     end
-    local inventory_state = read(pointer(inventory + 0x50, true) + inventory_index * 48, 48, true)
+    local inventory_state = read(pointer(inventory + 0x50, true) + inventory_index * 48, 48, true, 'inventory')
     local slot = u32(inventory_state, 0x1c)
     row.selected_slot = slot
     local slot_offsets = {[1] = 0, [2] = 4, [3] = 8, [4] = 16, [5] = 16, [6] = 12}
@@ -461,7 +551,7 @@ local function context_reader(api, game, extend)
     if read(pointer(pointer(weapon_manager + 0x40, true) + weapon_component * 8, true), 24, true) ~= weapon then
         return finish(row, 'weapon_driver_identity_mismatch')
     end
-    local driver_state = read(pointer(weapon_manager + 0x50, true) + weapon_component * 40, 40, true)
+    local driver_state = read(pointer(weapon_manager + 0x50, true) + weapon_component * 40, 40, true, 'driver')
     local flags = u32(driver_state, 0)
     row.weapon_driver_flags = string.format('%08x', flags)
     if bit.band(flags, 0x80) ~= 0 then row.ammo_path = 'weapon_magazine'
@@ -478,17 +568,11 @@ local function context_reader(api, game, extend)
         if read(pointer(pointer(rounds_manager + 0x40, true) + rounds_index * 8, true), 24, true) ~= weapon then
             return finish(row, 'rounds_component_identity_mismatch')
         end
-        local rounds = read(pointer(rounds_manager + 0x50, true) + rounds_index * 24, 24, true)
-        local runtime = read(pointer(rounds_manager + 0x58, true) + rounds_index * 20, 20, true)
-        local selected = u32(runtime, 4)
-        assert(selected <= 1, 'rounds_selected_magazine_invalid')
-        row.rounds_selected_magazine = selected
-        row.rounds_magazine_count = u32(rounds, 4 + selected * 4)
-        row.rounds_chamber_token = u32(rounds, 0x10)
-        row.rounds_chamber_blocked = runtime:byte(0x11) ~= 0
+        local rounds = read(pointer(rounds_manager + 0x50, true) + rounds_index * 24, 24, true, 'ammo')
+        local runtime = read(pointer(rounds_manager + 0x58, true) + rounds_index * 20, 20, true, 'runtime')
         row.ammo_counter_semantics = 'selected_magazine_only_not_backpack_or_chamber'
-        row.ammo_status = row.rounds_magazine_count > 0 and 'magazine_nonempty' or 'magazine_empty'
-        local e = {read=read, pointer=pointer, lookup=lookup, owner=owner, weapon_id=weapon_id}
+        decode_rounds(row, rounds, runtime)
+        local e = {read=read, pointer=pointer, lookup=lookup, owner=owner, weapon_id=weapon_id, metrics=metrics}
         local config = component_static_record(e, row, 'rounds')
         if config then
             local override = lookup(rounds_manager + 0x68, weapon_id, 65536)
@@ -514,10 +598,10 @@ local function context_reader(api, game, extend)
         row.ammo_status = 'unsupported_resource_component'
     elseif row.ammo_path == 'weapon_heat' then
         read_heat_component({read=read, pointer=pointer, global=global, lookup=lookup,
-            game=game, owner=owner, weapon_id=weapon_id, weapon=weapon}, row)
+            game=game, owner=owner, weapon_id=weapon_id, weapon=weapon, metrics=metrics}, row)
     elseif row.ammo_path == 'weapon_magazine' then
         read_magazine_component({read=read, pointer=pointer, global=global, lookup=lookup,
-            game=game, owner=owner, weapon_id=weapon_id, weapon=weapon}, row)
+            game=game, owner=owner, weapon_id=weapon_id, weapon=weapon, metrics=metrics}, row)
     else
         row.ammo_status = 'unknown_ammo_path'
     end
@@ -531,6 +615,8 @@ local function context_reader(api, game, extend)
         row.ammo_path == 'no_native_ammo_component' and 'SKIP_UNKNOWN' or 'NATIVE_R_ONLY_CANDIDATE'
     return finish(row, 'context_observed')
 end
+
+-- FAST_CONTEXT_READER_INSERT
 
 local function verify_build(pe)
     assert(pe:sub(1, 4) == 'PE\0\0' and (
@@ -568,6 +654,7 @@ end
 local api, game
 local setup_ok, setup_error = pcall(function()
     api = read_api()
+    perf_attach(api)
     game = assert(api.module('game.dll'), 'game_module_missing')
     local dos = assert(api.read(game, 64), 'module_header_unavailable')
     assert(dos:sub(1, 2) == 'MZ', 'module_header_invalid')
@@ -589,6 +676,7 @@ local setup_ok, setup_error = pcall(function()
     end
 end)
 if not setup_ok then emit('SETUP_ERROR error=' .. tostring(setup_error)) end
+if PERF then state.perf.active = 'other' end
 
 local function scalar(value)
     if value == nil then return 'nil' end
@@ -650,6 +738,60 @@ local function debug_near_empty(row)
          row.heat_overheated == true)
 end
 
+local function run_context(category, cache, capture)
+    local bucket = PERF and perf_bucket(category) or nil
+    local previous, started
+    if bucket then
+        bucket.reader_attempts = bucket.reader_attempts + 1
+        local field = cache and 'fast_readers' or 'full_readers'
+        bucket[field] = bucket[field] + 1
+        previous, state.perf.active = state.perf.active, category
+        started = api.perf_now()
+    end
+    local ok, row, reason, dependencies
+    if cache then ok, row, reason = pcall(fast_context_reader, api, cache, bucket)
+    else ok, row, reason, dependencies = pcall(context_reader, api, game, nil, bucket, capture) end
+    if not bucket then return ok, row, reason, dependencies end
+    bucket.reader_seconds = bucket.reader_seconds + api.perf_now() - started
+    state.perf.active = previous
+    if ok and row then
+        bucket.reader_successes = bucket.reader_successes + 1
+        if row.context_status == 'context_observed' then
+            bucket.observed_contexts = bucket.observed_contexts + 1
+        end
+    else
+        bucket.reader_failures = bucket.reader_failures + 1
+    end
+    return ok, row, reason, dependencies
+end
+
+local function observed_context(category)
+    local daily = OPTIMIZATION_STAGE >= 1 and not NATIVE_RELOAD and
+        (category == 'initialization' or category == 'periodic')
+    if daily and state.fast_context then
+        local ok, row, reason = run_context(category, state.fast_context)
+        if ok and row then
+            if PERF then perf_bucket(category).cache_hits = perf_bucket(category).cache_hits + 1 end
+            return ok, row, reason
+        end
+        state.fast_context = nil
+        if PERF then
+            local bucket = perf_bucket(category)
+            bucket.cache_invalidations = bucket.cache_invalidations + 1
+        end
+        state.last_cache_invalidation = scalar(ok and reason or row)
+    end
+    -- At most one complete fallback per sampling call. Action refreshes always stay complete.
+    local ok, row, reason, dependencies = run_context(category, nil, daily)
+    if daily then
+        state.fast_context = ok and cache_context(row, dependencies) or nil
+        if PERF and state.fast_context then
+            perf_bucket(category).cache_builds = perf_bucket(category).cache_builds + 1
+        end
+    end
+    return ok, row, reason
+end
+
 local function snapshot(phase)
     state.snapshots = state.snapshots + 1
     if not setup_ok then return end
@@ -658,7 +800,7 @@ local function snapshot(phase)
         debug_emit(string.format('DEBUG_SNAPSHOT_BEGIN tick=%d elapsed=%.3f phase=%s',
             state.ticks, state.elapsed, phase))
     end
-    local ok, row, reason = pcall(context_reader, api, game)
+    local ok, row, reason = observed_context(phase == 'initial' and 'initialization' or 'periodic')
     if trace or debug_near_empty(row) then
         debug_emit(string.format(
             'DEBUG_SNAPSHOT_END tick=%d elapsed=%.3f ok=%s status=%s resource=%s mag=%s chamber=%s',
@@ -821,6 +963,30 @@ local function fresh_context_matches(row, fresh)
         fresh.current_weapon_resource == row.current_weapon_resource
 end
 
+local auto_reload_step
+local replaying_fresh_context = false
+local function replay_changed_ammo(row, fresh)
+    if OPTIMIZATION_STAGE < 2 then return false end
+    local changed = row.magazine_count ~= fresh.magazine_count or
+        row.magazine_chamber_token ~= fresh.magazine_chamber_token or
+        row.magazine_chamber_blocked ~= fresh.magazine_chamber_blocked or
+        row.rounds_magazine_count ~= fresh.rounds_magazine_count or
+        row.rounds_chamber_token ~= fresh.rounds_chamber_token or
+        row.rounds_chamber_blocked ~= fresh.rounds_chamber_blocked or
+        row.rounds_selected_magazine ~= fresh.rounds_selected_magazine or
+        row.heat_overheated ~= fresh.heat_overheated
+    if not changed then return false end
+    -- The full action refresh is a real observation. Reapply the existing priority
+    -- once so a stale >1 sample cannot send continuous_load before last-round handling.
+    state.latest_row, state.latest_at = fresh, state.elapsed
+    if not replaying_fresh_context then
+        replaying_fresh_context = true
+        auto_reload_step()
+        replaying_fresh_context = false
+    end
+    return true
+end
+
 local function native_retry_due(request)
     return request and request.at and state.elapsed - request.at >= 8 and
         state.last_lmb_press_at and state.last_lmb_press_at >= request.at + 8
@@ -853,7 +1019,7 @@ local function reload_request(reason, expected_tactical_count)
     -- Refresh selection and ammo immediately before sending input.
     debug_emit(string.format('DEBUG_RELOAD_REFRESH_BEGIN tick=%d elapsed=%.3f',
         state.ticks, state.elapsed))
-    local ok_read, fresh = pcall(context_reader, api, game)
+    local ok_read, fresh = observed_context('reload_refresh')
     debug_emit(string.format('DEBUG_RELOAD_REFRESH_END tick=%d elapsed=%.3f ok=%s status=%s',
         state.ticks, state.elapsed, tostring(ok_read),
         scalar(type(fresh) == 'table' and fresh.context_status or fresh)))
@@ -861,6 +1027,7 @@ local function reload_request(reason, expected_tactical_count)
         debug_emit('DEBUG_RELOAD_SKIP reason=fresh_context_rejected')
         return
     end
+    if replay_changed_ammo(state.latest_row, fresh) then return end
     if expected_tactical_count and
         (tactical_ammo_count(fresh, tactical_rule(fresh)) or math.huge) > expected_tactical_count then
         debug_emit('DEBUG_RELOAD_SKIP reason=last_round_changed')
@@ -888,7 +1055,7 @@ local function reload_request(reason, expected_tactical_count)
     return ok
 end
 
-local function auto_reload_step()
+auto_reload_step = function()
     local row = state.latest_row
     if not row or row.context_status ~= 'context_observed' or
         (row.ammo_path ~= 'weapon_rounds' and row.ammo_path ~= 'weapon_magazine' and row.ammo_path ~= 'weapon_heat') or row.weapon_owned ~= true or
@@ -1059,11 +1226,12 @@ local function continuous_reload_step()
     state.continuous_probe_at = state.elapsed
     debug_emit(string.format('DEBUG_CONTINUOUS_REFRESH_BEGIN tick=%d elapsed=%.3f',
         state.ticks, state.elapsed))
-    local ok_read, fresh = pcall(context_reader, api, game)
+    local ok_read, fresh = observed_context('continuous_refresh')
     if not ok_read or not fresh_context_matches(row, fresh) then
         debug_emit('DEBUG_CONTINUOUS_SKIP reason=fresh_context_rejected')
         return
     end
+    if replay_changed_ammo(row, fresh) then return end
     local fresh_count = tactical_ammo_count(fresh, tactical_rule(fresh))
     if use_native and (fresh.native_action_active ~= false or not fresh_count or
         (native_request and (not native_request.count or
@@ -1088,6 +1256,8 @@ local function continuous_reload_step()
 end
 
 emit('START revision=' .. state.revision .. ' debug=' .. tostring(DEBUG) ..
+    ' perf=' .. tostring(PERF) ..
+    ' optimization_stage=' .. tostring(OPTIMIZATION_STAGE) ..
     ' tactical_reload=' .. tostring(ENABLE_TACTICAL_RELOAD) ..
     ' reload_delay=0 heat_overheat_reload=true rounds_and_magazine=true no_native_calls=' ..
     tostring(not NATIVE_RELOAD) .. ' native_reload_preferred=' .. tostring(NATIVE_RELOAD) ..
@@ -1095,8 +1265,28 @@ emit('START revision=' .. state.revision .. ' debug=' .. tostring(DEBUG) ..
 snapshot('initial')
 
 local original_update = rawget(_G, 'update')
+local function poll_due(focused)
+    if OPTIMIZATION_STAGE < 2 then
+        return focused or not state.last_snapshot or state.elapsed - state.last_snapshot >= 0.05
+    end
+    local now = api.poll_now()
+    local interval = focused and 1 / 120 or 0.05
+    if state.poll_focused ~= focused or (state.last_poll_clock and now < state.last_poll_clock) then
+        state.fast_context, state.latest_row, state.latest_at = nil, nil, nil
+        state.next_poll = now
+    end
+    state.poll_focused, state.last_poll_clock = focused, now
+    if not state.next_poll or now + 1e-9 >= state.next_poll then
+        local deadline = state.next_poll or now
+        local steps = math.max(1, math.floor((now - deadline + 1e-9) / interval) + 1)
+        state.next_poll = deadline + steps * interval
+        return true
+    end
+    return false
+end
 local function update(dt, ...)
     state.ticks = state.ticks + 1
+    if PERF then state.perf.updates = state.perf.updates + 1 end
     if setup_ok then
         state.started_at = state.started_at or api.now()
         state.elapsed = api.now() - state.started_at
@@ -1107,7 +1297,7 @@ local function update(dt, ...)
             debug_emit(string.format('DEBUG_EMPTY_ATTACK_FRAME tick=%d elapsed=%.3f',
                 state.ticks, state.elapsed))
         end
-        if api.game_focused() or not state.last_snapshot or state.elapsed - state.last_snapshot >= 0.05 then
+        if poll_due(api.game_focused()) then
             state.last_snapshot = state.elapsed
             snapshot('periodic')
         end
@@ -1119,6 +1309,7 @@ local function update(dt, ...)
         end
         auto_reload_step()
         continuous_reload_step()
+        perf_report()
         if trace_step then
             debug_emit(string.format('DEBUG_AUTO_STEP_END tick=%d elapsed=%.3f',
                 state.ticks, state.elapsed))
