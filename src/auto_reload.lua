@@ -53,7 +53,8 @@ end
 local perf_fields = {'read_attempts', 'read_successes', 'read_failures', 'requested_bytes',
     'guard_rereads', 'map_checks', 'map_reads', 'map_bytes', 'reader_attempts',
     'reader_successes', 'reader_failures', 'observed_contexts', 'reader_seconds',
-    'full_readers', 'fast_readers', 'cache_hits', 'cache_invalidations', 'cache_builds'}
+    'full_readers', 'fast_readers', 'cache_hits', 'cache_invalidations', 'cache_builds',
+    'poll_20_samples', 'poll_30_samples', 'poll_60_samples', 'poll_120_samples', 'poll_immediate_samples'}
 local perf_categories = {'initialization', 'periodic', 'reload_refresh', 'continuous_refresh', 'other'}
 local function perf_bucket(name)
     local bucket = state.perf.categories[name]
@@ -785,6 +786,7 @@ local function observed_context(category)
     local ok, row, reason, dependencies = run_context(category, nil, daily)
     if daily then
         state.fast_context = ok and cache_context(row, dependencies) or nil
+        if OPTIMIZATION_STAGE >= 3 then state.adaptive_reset = true end
         if PERF and state.fast_context then
             perf_bucket(category).cache_builds = perf_bucket(category).cache_builds + 1
         end
@@ -792,6 +794,7 @@ local function observed_context(category)
     return ok, row, reason
 end
 
+local adaptive_observe
 local function snapshot(phase)
     state.snapshots = state.snapshots + 1
     if not setup_ok then return end
@@ -801,6 +804,7 @@ local function snapshot(phase)
             state.ticks, state.elapsed, phase))
     end
     local ok, row, reason = observed_context(phase == 'initial' and 'initialization' or 'periodic')
+    if OPTIMIZATION_STAGE >= 3 then adaptive_observe(ok and row or nil) end
     if trace or debug_near_empty(row) then
         debug_emit(string.format(
             'DEBUG_SNAPSHOT_END tick=%d elapsed=%.3f ok=%s status=%s resource=%s mag=%s chamber=%s',
@@ -844,6 +848,10 @@ local function input_probe()
         if state.keys == nil then state.keys = {} end
         if state.keys[name] ~= down then
             state.keys[name] = down
+            if OPTIMIZATION_STAGE >= 3 and (name == 'LMB' or name == 'RMB' or name == 'R') then
+                state.adaptive_input_at = api.poll_now()
+                if down then state.poll_input_edge = true end
+            end
             if name == 'LMB' and down then
                 state.lmb_edge_time = state.elapsed
                 state.last_lmb_press_at = state.elapsed
@@ -1255,6 +1263,73 @@ local function continuous_reload_step()
     end
 end
 
+-- No firing-rate bound is available. Only stable idle states may sample slower;
+-- an attack edge observes immediately and held fire always uses the P2 rate.
+adaptive_observe = function(row)
+    local rule = tactical_rule(row)
+    local count = tactical_ammo_count(row, rule)
+    if not row or row.context_status ~= 'context_observed' or not state.fast_context or
+        row.weapon_owned ~= true or not rule or not count or
+        attack_only_resources[row.current_weapon_resource] or unsafe_resources[row.current_weapon_resource] then
+        state.adaptive = nil
+        state.adaptive_reset = nil
+        return
+    end
+    local key = table.concat({row.current_weapon_resource, tostring(row.selected_entity_id),
+        tostring(row.selected_slot), tostring(row._weapon_bytes), tostring(row.local_entity_id),
+        row.ammo_path, tostring(rule.limit), tostring(rule.basis)}, ':')
+    local token = row.magazine_chamber_token or row.rounds_chamber_token
+    local blocked = row.magazine_chamber_blocked or row.rounds_chamber_blocked
+    local selected = row.rounds_selected_magazine
+    local now, previous = api.poll_now(), state.adaptive
+    local same_identity = previous and previous.key == key
+    local hazard = state.adaptive_hazard
+    local same_hazard = hazard and hazard.key == key
+    local max_drop = same_hazard and hazard.max_drop or 0
+    local unexplained = same_hazard and hazard.unexplained or false
+    if same_identity and previous.count > count then
+        max_drop = math.max(max_drop, previous.count-count)
+        local keys = state.keys or {}
+        if not keys.LMB and now-(state.adaptive_input_at or -math.huge) >= 0.6 then
+            -- Consumption with no recent observed input has no safe idle bound.
+            -- Keep this weapon at 120 Hz until its identity changes.
+            unexplained = true
+        end
+    end
+    state.adaptive_hazard = {key=key, max_drop=max_drop, unexplained=unexplained}
+    if state.adaptive_reset or not previous or previous.key ~= key or previous.count ~= count or
+        previous.token ~= token or previous.blocked ~= blocked or previous.selected ~= selected then
+        state.adaptive = {key=key, count=count, token=token, blocked=blocked, selected=selected,
+            stable_since=now, observations=1, max_drop=max_drop, unexplained=unexplained}
+    else
+        previous.observations = previous.observations + 1
+    end
+    state.adaptive_reset = nil
+end
+
+local function adaptive_poll_hz(now)
+    local row, stable, keys = state.latest_row, state.adaptive, state.keys or {}
+    if not stable or stable.unexplained or not row or not state.fast_context or not state.latest_at or
+        state.elapsed - state.latest_at > 0.25 or keys.LMB or keys.RMB or keys.R or
+        state.attempted or state.request_at or state.empty_since or
+        (api.own_reload_active and api.own_reload_active()) or
+        now - (state.adaptive_input_at or stable.stable_since) < 0.6 or
+        now - stable.stable_since < 0.6 or stable.observations < 2 then return 120 end
+    local rule = tactical_rule(row)
+    local count = tactical_ammo_count(row, rule)
+    if not rule or not count or attack_only_resources[row.current_weapon_resource] or
+        unsafe_resources[row.current_weapon_resource] then return 120 end
+    -- Use the original magazine/total basis and protect the last-round branch.
+    -- Project the largest observed drop over 2/4 high-rate slots, never an
+    -- average rate. This margin only selects idle tiers, not firing safety.
+    local window = math.max(rule.limit, 1)
+    local headroom = count - window
+    if headroom <= 0 then return 120 end
+    if headroom >= math.max(window, stable.max_drop * 4) then return 30 end
+    if headroom >= stable.max_drop * 2 then return 60 end
+    return 120
+end
+
 emit('START revision=' .. state.revision .. ' debug=' .. tostring(DEBUG) ..
     ' perf=' .. tostring(PERF) ..
     ' optimization_stage=' .. tostring(OPTIMIZATION_STAGE) ..
@@ -1270,12 +1345,52 @@ local function poll_due(focused)
         return focused or not state.last_snapshot or state.elapsed - state.last_snapshot >= 0.05
     end
     local now = api.poll_now()
-    local interval = focused and 1 / 120 or 0.05
+    local hz = focused and 120 or 20
+    if OPTIMIZATION_STAGE >= 3 and focused then hz = adaptive_poll_hz(now) end
+    local interval = 1 / hz
     if state.poll_focused ~= focused or (state.last_poll_clock and now < state.last_poll_clock) then
         state.fast_context, state.latest_row, state.latest_at = nil, nil, nil
+        if OPTIMIZATION_STAGE >= 3 then state.adaptive = nil; hz = focused and 120 or 20; interval = 1 / hz end
         state.next_poll = now
     end
     state.poll_focused, state.last_poll_clock = focused, now
+    local immediate = OPTIMIZATION_STAGE >= 3 and focused and state.poll_input_edge
+    if OPTIMIZATION_STAGE >= 3 then
+        -- Keep the P2 high-rate lattice running even while idle. Extra edge
+        -- observations must not move later continuous-reload sample boundaries.
+        if not state.high_poll_deadline or state.adaptive_clock_focused ~= focused or
+            (state.adaptive_clock_last and now < state.adaptive_clock_last) then
+            state.high_poll_deadline = now
+        end
+        state.adaptive_clock_focused, state.adaptive_clock_last = focused, now
+        local high_interval = focused and 1/120 or 0.05
+        local high_due = now + 1e-9 >= state.high_poll_deadline
+        if high_due then
+            local steps = math.max(1, math.floor((now-state.high_poll_deadline+1e-9)/high_interval)+1)
+            state.high_poll_deadline = state.high_poll_deadline + steps * high_interval
+        end
+        local due
+        if hz == 120 or not focused then
+            due = high_due or immediate
+            state.next_poll = state.high_poll_deadline
+        else
+            if state.poll_hz ~= hz then state.next_poll = now end
+            due = not state.next_poll or now + 1e-9 >= state.next_poll
+            if due then
+                local deadline = state.next_poll or now
+                local steps = math.max(1, math.floor((now-deadline+1e-9)/interval)+1)
+                state.next_poll = deadline + steps * interval
+            end
+        end
+        state.poll_hz, state.poll_input_edge = hz, nil
+        if due and PERF then
+            local bucket = perf_bucket('periodic')
+            local field = 'poll_' .. hz .. '_samples'
+            bucket[field] = bucket[field] + 1
+            if immediate then bucket.poll_immediate_samples = bucket.poll_immediate_samples + 1 end
+        end
+        return due
+    end
     if not state.next_poll or now + 1e-9 >= state.next_poll then
         local deadline = state.next_poll or now
         local steps = math.max(1, math.floor((now - deadline + 1e-9) / interval) + 1)

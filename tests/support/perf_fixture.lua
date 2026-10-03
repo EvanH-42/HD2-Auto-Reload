@@ -22,7 +22,8 @@ function M.clock()
     return tonumber(counter[0]) / divisor
 end
 
-function M.new(kind, perf, source_path)
+function M.new(kind, perf, source_path, options)
+    options = options or {}
     assert(kind == 'magazine' or kind == 'rounds' or kind == 'heat')
     local source = file(source_path or 'build/auto_reload_entry_tactical_perf.lua')
     local pages, logs, events = {}, {}, {}
@@ -74,8 +75,8 @@ function M.new(kind, perf, source_path)
     end
     local component = kind:sub(1, 1):upper() .. kind:sub(2)
     local static_map = unhex(file('data/Weapon' .. component .. 'Component.25327279.map.hex'))
-    local resource_id = kind == 'magazine' and '968211c0033dce64' or
-        kind == 'rounds' and '41eac4a03987faa0' or nil
+    local resource_id = options.resource_id or (kind == 'magazine' and '968211c0033dce64' or
+        kind == 'rounds' and '41eac4a03987faa0' or nil)
     local key, index
     for offset = 0, #static_map - 16, 16 do
         local candidate = static_map:sub(offset + 1, offset + 8)
@@ -126,7 +127,7 @@ function M.new(kind, perf, source_path)
             put(state_address + 4, word(count)); put(state_address + 0x10, word(token or 0))
         end
     end
-    fixture.ammo(20)
+    fixture.ammo(options.initial_count or 20, options.initial_token)
     -- Only the verified input build is supported by this fixture.
     local dos = 'MZ' .. string.rep('\0', 58) .. word(0x80)
     put(game, dos)

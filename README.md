@@ -62,6 +62,11 @@ P0 构建不改变换弹规则或采样频率。`START` 行记录 `perf=true`，
 启用缓存及前台 120 Hz 日常采样。这两个阶段要求 `--enable-tactical-reload`，自动启用统计，
 分别生成 `Auto-Reload-v0.7.0-tactical-p1-perf.zip` 和 `Auto-Reload-v0.7.0-tactical-p2-perf.zip`。
 一次只安装一份，替换后重启游戏。离线结果与实机对照见 [P1/P2 说明](docs/PERFORMANCE_P1_P2.md)。
+
+`--optimization-stage p3` 在 P2 基础上对稳定空闲状态使用 30/60 Hz；射击、窗口内、Heat、
+attack-only 和不确定状态仍用 120 Hz，新点击立即采样。生成独立的
+`Auto-Reload-v0.7.0-tactical-p3-perf.zip`，自动启用统计；要求 tactical 输入模式。
+2026-10-04 用户反馈 P3 实机正常，并确认 P1/P2 正常，本轮优化至 P3 收尾；详见 [P3 说明](docs/PERFORMANCE_P3.md)。
 详见 [统计口径与离线测量](docs/PERFORMANCE_P0.md)。此统计版沿用相同 GUID，应替换现有包，仅启用一份。
 
 ### 原生换弹实验包

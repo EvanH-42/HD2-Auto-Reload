@@ -1,10 +1,10 @@
 # 性能优化状态与交接
 
-更新时间：2026-10-03（Asia/Taipei）
+更新时间：2026-10-04（Asia/Taipei）
 
 ## 当前结论
 
-P0–P2 已实现并完成自动验证和离线测量。交付 P1 与 P1+P2 两份独立 tactical 输入包，均默认启用 P0 统计；P1 保留前台每 update 采样，P2 前台限为 120 Hz。P1/P2 实机状态为测试中，尚未验收；已授权继续 P3。目标见 [PERFORMANCE_PLAN.md](PERFORMANCE_PLAN.md)，P0 口径见 [PERFORMANCE_P0.md](PERFORMANCE_P0.md)，两包对照与人工步骤见 [PERFORMANCE_P1_P2.md](PERFORMANCE_P1_P2.md)。
+P0–P3 优化已完成。2026-10-04 用户反馈 P3 实机正常运行，并据此确认 P1/P2 状态正常；三阶段验收关闭，未获得量化实机 CPU/FPS 数据。P0–P2 已提交 `00b44da`；P3 源码、测试和验收文档列入本次收尾提交并同步 origin/main。保留三份已验收 ZIP、回归所需 Lua 与测量证据，清理冗余构建变体和重复日志。目标见 [PERFORMANCE_PLAN.md](PERFORMANCE_PLAN.md)，P0 口径见 [PERFORMANCE_P0.md](PERFORMANCE_P0.md)，第一步说明见 [PERFORMANCE_P1_P2.md](PERFORMANCE_P1_P2.md)，P3 策略与数据见 [PERFORMANCE_P3.md](PERFORMANCE_P3.md)。
 
 ## 授权与范围
 
@@ -12,7 +12,7 @@ P0–P2 已实现并完成自动验证和离线测量。交付 P1 与 P1+P2 两�
 - 使用 tactical 输入构建，保持原有规则与功能，不加入 Fire Guard。
 - 用户已确认实施首步 P0 方案，允许找不到现有 LuaJIT 时使用项目本地工具；未改系统 PATH。
 - 后续授权持续推进到 P2，保留 P1 与 P1+P2 两份默认开启统计的包供实机比较。
-- 用户已授权提交当前 P0–P2 进度，并继续 P3 构建和自动验证；未授权推送、发布或游戏部署。
+- 用户已授权本次收尾清理、提交并推送 GitHub；目标为自己的 fork origin/main，不向 upstream 推送，不创建发行版或自动部署游戏。
 - P4–P6 不在范围内。P1 必要缓存有效性检查不能被误解为可删掉完整 guards。
 
 ## 仓库基线
@@ -37,6 +37,9 @@ P0–P2 已实现并完成自动验证和离线测量。交付 P1 与 P1+P2 两�
 8. P1 收集完整依赖，缓存解析结果并合并同页读取；所有静态 map/config 内容与 guards 仍验证，失效最多一次完整回退。两条发送前完整复核保留。
 9. P2 用 QPC 累计期限调度日常读取；输入、松键、原回调仍每 update。完整复核发现弹药变化时有界重跑原策略，保留最后一发优先级。
 10. 新增 --optimization-stage p0/p1/p2；P1/P2 要求 tactical 输入模式并自动启用 PERF，保留独立 ZIP。新增缓存/调度回归，生成三个阶段同轨迹 CSV。
+11. 提交 P0–P2：`00b44da00a000f599b3c995ace3b261682461f5b`。提交作者采用核验的 GitHub 登录身份与 noreply 邮箱，仅命令级设置，未改全局配置。
+12. P3 稳定空闲 30/60 Hz，活动及不确定状态 120 Hz，边沿立即观察且保留 P2 高频相位；最大观察扣弹裕量、无输入扣弹保护、稳定期/重置和各档实际采样统计已实现。
+13. P3 回归包含三类弹药/五帧率、零/总弹阈值、未知/attack-only、自动/快速点击/抖动、多发骤降、失败/恢复/焦点/时钟和统计开关。Python 优化产物测试改用临时源码副本，保护已交付 P1/P2。
 
 ## 阶段状态
 
@@ -44,18 +47,17 @@ P0–P2 已实现并完成自动验证和离线测量。交付 P1 与 P1+P2 两�
 |---|---|---|---|
 | 目标与计划 | 已完成 | 文档检查 | 不适用 |
 | P0 基线/统计 | 已完成 | 已通过，离线测量已生成 | 未测量/未验收 |
-| P1 快速上下文缓存 | 已完成 | 已通过，离线测量已生成 | 测试中，未验收 |
-| P2 固定 120 Hz | 已完成 | 已通过，离线测量已生成 | 测试中，未验收 |
-| 第一步 P0–P2 交付 | 已完成 | P1/P1+P2 两份包已生成 | 未验收 |
-| P3 自适应采样 | 未开始 | 未运行 | 未验收 |
+| P1 快速上下文缓存 | 已完成 | 已通过，离线测量已生成 | 用户确认正常（依据 P3 验收） |
+| P2 固定 120 Hz | 已完成 | 已通过，离线测量已生成 | 用户确认正常（依据 P3 验收） |
+| 第一步 P0–P2 交付 | 已完成 | P1/P1+P2 两份包保留 | 用户确认通过 |
+| P3 自适应采样 | 已完成 | 已通过，四场景 P2/P3 测量已生成 | 用户实机测试通过，正常运行 |
 
 已有同夹具 P0/P1/P2 读取量与批量耗时，无游戏内 CPU/FPS 改善数据。240 FPS 下 P1 调用量下降约 30%，P1+P2 下降约 63%–64%；仅为模拟结果。
 
 ## 下一步执行顺序
 
-1. 用户用 P1 和 P1+P2 替换测试，分别重启游戏并保存 START/PERF/请求与恢复日志；一次只装一包。
-2. 检查高速射击、快速点击、逐发续装、Heat、切枪、重生和焦点恢复；实机异常先定位。
-3. 根据第一步实机状态细化并实施独立 P3；范围仍止于 P3。复用当前本地工具，不重复安装，不自动部署。
+1. 本轮至 P3 收尾，不继续 P4–P6。
+2. 后续仅根据新反馈处理问题；保留的三个包一次只装一个。用户验收不代表已量化实机性能，也不代表原生实验版或 MG-43 历史问题得到专项验收。
 
 ## 交接时不能遗漏的风险
 
@@ -100,8 +102,28 @@ Python 实际路径：%LOCALAPPDATA%/Programs/Python/Python313/python.exe，版�
 
 本次交付：build/Auto-Reload-v0.7.0-tactical-p1-perf.zip 与 build/Auto-Reload-v0.7.0-tactical-p2-perf.zip，两个文件同时保留。模拟 10 秒、240 FPS 的 Magazine/Rounds/Heat：P0 读取 224143/212636/206699 次，P1 154738/147711/146284 次，P2 83196/76240/74698 次；含初始化与发送复核。三类日常采样 P0/P1 为 2287 次，P2 为 1153 次，含失焦。
 
-UTF-8/空白格式和 Git 差异检查在交付前完成。本次授权提交 P0–P2 进度；未推送、未部署，实机仍未验收。
+UTF-8/空白格式和 Git 差异检查在交付前完成。P0–P2 已提交；P3 纳入本次收尾提交。2026-10-04 用户确认正常，未自动部署游戏。
 
 保留的安装包位于 Git 忽略的 build/，不将生成二进制加入源码提交。P1 SHA256：`BEBAD72071D893414C8650260876F3F86037CDC7518EC43A1F5C7EDC5EFECB8A`；P2 SHA256：`3162AA3B8E29252AF4DBD7416B1B7A60C4C9CC71375C0BA5C46B9E922C57888D`。P3 使用独立文件名，不覆盖这两份实机对照包。
+
+## P3 最终验证与产物
+
+Python 11 项通过（含隔离构建 P1/P2/P3、隐式统计、模式限制、ZIP/payload）。原控制器 62 项及 map/context/read_api 检查通过，existing-declaration/perf/p2/p3 Windows API 初始化通过。test_perf.lua、test_optimization.lua 和新增 test_adaptive.lua 全部通过。最后运行已包含多发裕量与跨失败风险记录的最终源码。
+
+命令：`python -m unittest discover -s tests -p 'test_*.py'`；默认及 tactical-perf 构建；`luajit tests/test_adaptive.lua`；全部上列既有 Lua 入口；`luajit tests/test_read_api.lua p3`；`git diff --check`。实际工具仍为上述 Python 与项目本地 LuaJIT，未修改 PATH。
+
+日志：build/validation-p3-python.log、build/validation-p3-test_*.log。四场景测量：`luajit scripts/benchmark.lua 10 3 p2|p3 trajectory|idle_far|idle_near|held_fire`；各 stage/scenario 单独执行，不将竖线作为实际命令。CSV 为 build/benchmark-p2-*.csv 与 build/benchmark-p3-*.csv，各 30 条行。
+
+240 FPS 的稳定远离/邻近 Magazine：P2 1200 次采样、76942 次读取；P3 分别 354/636 次采样、22798/40846 次读取。持续按住时均 1200 次采样、76942 次读取。混合轨迹 P3 1157 次采样，比 P2 1153 多 4 次；此轨迹频繁变化，未降频，额外边沿采样稍增加成本。全部为离线模拟，无实机 CPU/FPS 改善结论。
+
+交付：build/Auto-Reload-v0.7.0-tactical-p3-perf.zip；entry 为 build/auto_reload_entry_tactical_p3_perf.lua。SHA256：`92EB9062AD98E66DAAAAF72D34D60BD3696C38AE3E8B4F49A7AFA60008540168`。P1/P2 两包 SHA256 仍与本次提交记录一致。
+
+## 2026-10-04 收尾
+
+用户实机反馈：P3 可正常运行；用户同时确认 P1/P2 正常。记录为功能验收通过，未推断游戏版本、武器专项覆盖或 CPU/FPS 改善比例。
+
+清理 build/ 内 23 个冗余文件：非阶段安装包、多余 debug/普通生成 Lua、旧的重复 P0/P2 测试日志。保留 P1/P2/P3 三份 ZIP、五份回归必需 Lua、全部 CSV 和最终 validation-p3 日志。三份 ZIP 的 SHA256 均与交付记录一致。tools/ 下本地 LuaJIT 与源码保留，未修改系统 PATH。
+
+本次仅将源码、测试与验收文档提交并同步 GitHub fork 的 main；build/ 仍保持 Git 忽略，安装包本地保留。无新代码修改，因此沿用已完成的 Python/Lua 和用户实机验收证据，收尾只检查差异、编码及保留产物。
 
 后续每步更新本文件的阶段表和此节，附真实命令、结果及必要数据摘要；长期目标与验收口径写在计划文档，当前进度写在这里。

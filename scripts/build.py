@@ -82,15 +82,15 @@ def main():
     parser.add_argument('--game-dir', type=Path, help='Optional local game directory for SHA256 verification')
     parser.add_argument('--debug', action='store_true', help='Build a diagnostic package with reload trace logging')
     parser.add_argument('--perf', action='store_true', help='Enable cumulative performance counters every 10 seconds')
-    parser.add_argument('--optimization-stage', choices=('p0', 'p1', 'p2'), default='p0',
-                        help='p1: cached reader; p2: cached reader plus 120 Hz polling; p1/p2 enable perf')
+    parser.add_argument('--optimization-stage', choices=('p0', 'p1', 'p2', 'p3'), default='p0',
+                        help='p1: cache; p2: 120 Hz; p3: adaptive idle polling; p1/p2/p3 enable perf')
     parser.add_argument('--enable-tactical-reload', action='store_true',
                         help='启用战术换弹 in the built package; no in-game setting')
     parser.add_argument('--native-reload', action='store_true',
                         help='Build the experimental native reload package for build 25480438')
     args = parser.parse_args()
     if args.optimization_stage != 'p0' and (args.native_reload or not args.enable_tactical_reload):
-        parser.error('p1/p2 require --enable-tactical-reload and do not support --native-reload')
+        parser.error('p1/p2/p3 require --enable-tactical-reload and do not support --native-reload')
     args.perf = args.perf or args.optimization_stage != 'p0'
     if args.native_reload and not args.game_dir:
         parser.error('Native reload requires --game-dir for SHA256 verification')

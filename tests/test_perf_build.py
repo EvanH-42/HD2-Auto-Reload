@@ -7,6 +7,8 @@ import subprocess
 import sys
 import unittest
 import zipfile
+import shutil
+import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'scripts'))
@@ -47,17 +49,26 @@ class PerfBuildTests(unittest.TestCase):
         self.assertIn('requires --game-dir', result.stderr)
 
     def test_optimization_stage_artifacts(self):
+        # Build into an isolated copy so the user's retained P1/P2 comparison
+        # packages and their generated entry files cannot be overwritten.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ('scripts', 'src', 'data'):
+                shutil.copytree(ROOT / name, root / name)
+            self.check_optimization_artifacts(root)
+
+    def check_optimization_artifacts(self, root):
         artifacts = []
-        for stage in ('p1', 'p2'):
-            subprocess.run([sys.executable, str(ROOT / 'scripts/build.py'), '--enable-tactical-reload',
-                            '--optimization-stage', stage], cwd=ROOT, check=True, capture_output=True)
-            entry = (ROOT / 'build' / f'auto_reload_entry_tactical_{stage}_perf.lua').read_bytes()
+        for stage in ('p1', 'p2', 'p3'):
+            subprocess.run([sys.executable, str(root / 'scripts/build.py'), '--enable-tactical-reload',
+                            '--optimization-stage', stage], cwd=root, check=True, capture_output=True)
+            entry = (root / 'build' / f'auto_reload_entry_tactical_{stage}_perf.lua').read_bytes()
             self.assertIn(f'local OPTIMIZATION_STAGE = {stage[-1]} -- OPTIMIZATION_STAGE_FLAG'.encode(), entry)
             self.assertIn(b'local PERF = true -- PERF_BUILD_FLAG', entry)
             self.assertIn(b'local ENABLE_TACTICAL_RELOAD = true', entry)
             self.assertIn(b'local NATIVE_RELOAD = false -- NATIVE_RELOAD_FLAG', entry)
             self.assertNotIn(b'-- FAST_CONTEXT_READER_INSERT', entry)
-            output = ROOT / 'build' / f'Auto-Reload-v0.7.0-tactical-{stage}-perf.zip'
+            output = root / 'build' / f'Auto-Reload-v0.7.0-tactical-{stage}-perf.zip'
             artifacts.append(output)
             with zipfile.ZipFile(output) as archive:
                 self.assertIsNone(archive.testzip())
@@ -67,16 +78,16 @@ class PerfBuildTests(unittest.TestCase):
                 record = struct.unpack_from('<7Q6I', payload, 104)
                 self.assertEqual(payload[record[2] + 8:record[2] + record[7]], entry)
         self.assertTrue(all(path.is_file() for path in artifacts))
-        self.assertNotEqual(artifacts[0].read_bytes(), artifacts[1].read_bytes())
+        self.assertEqual(len({path.read_bytes() for path in artifacts}), 3)
 
     def test_optimization_stage_rejects_other_modes(self):
-        for stage in ('p1', 'p2'):
+        for stage in ('p1', 'p2', 'p3'):
             for flags in ([], ['--enable-tactical-reload', '--native-reload']):
                 result = subprocess.run([sys.executable, str(ROOT / 'scripts/build.py'),
                                          '--optimization-stage', stage, *flags],
                                         cwd=ROOT, capture_output=True, text=True)
                 self.assertEqual(result.returncode, 2)
-                self.assertIn('p1/p2 require', result.stderr)
+                self.assertIn('p1/p2/p3 require', result.stderr)
 
 
 if __name__ == '__main__':
